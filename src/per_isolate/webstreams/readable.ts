@@ -122,6 +122,7 @@ const {
   kNullProtoObject,
   kEnumerable,
   toStringTagProperty,
+  promiseResolvedWith,
   requireObject,
   toDictionary,
   convertQueuingStrategy,
@@ -1524,7 +1525,7 @@ class QueuedControllerCore<T, R> {
   // settles, and a rejection errors the stream.
   start(startResult: unknown): void {
     PromisePrototypeThen(
-      writableInternals.promiseResolvedWith(startResult),
+      promiseResolvedWith(startResult),
       () => {
         this.#started = true;
         this.callPullIfNeeded();
@@ -3434,7 +3435,7 @@ function closeAsyncIterator(iterator: object, reason: unknown): Promise<void> {
     return PromiseReject(e);
   }
   return PromisePrototypeThen(
-    writableInternals.promiseResolvedWith(returnResult),
+    promiseResolvedWith(returnResult),
     (iterResult: unknown) => {
       if (!isObjectLike(iterResult)) {
         throw new TypeError('The return method must return an object');
@@ -3496,7 +3497,7 @@ function readableStreamFromIterable<R>(
           return PromiseReject(e);
         }
         return PromisePrototypeThen(
-          writableInternals.promiseResolvedWith(nextResult),
+          promiseResolvedWith(nextResult),
           (iterResult: unknown) => {
             if (!isObjectLike(iterResult)) {
               throw new TypeError('The result of next() must be an object');
