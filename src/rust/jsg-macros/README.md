@@ -20,6 +20,11 @@ Generates `jsg::Struct`, `jsg::Type`, `jsg::ToJS`, and `jsg::FromJS` for a plain
 struct. Only `pub` fields are projected into the JavaScript object. Use
 `#[jsg_struct(name = "MyName")]` to override the JavaScript class name.
 
+Like C++ JSG's `JSG_STRUCT`, converting to JavaScript follows the `fast_jsg_struct` flag: with
+it, the fields are defined as data properties, an absent optional field as `undefined`, and no
+JavaScript runs; without it, they are set one by one, an absent optional field is omitted, and a
+setter on `Object.prototype` runs, and what it throws is passed on.
+
 ```rust
 #[jsg_struct]
 pub struct CaaRecord {
@@ -57,7 +62,8 @@ Generates a V8 `FunctionCallback` for a method on a `#[jsg_resource]` type.
   The macro matches both the name `this` and the type, so a JavaScript argument of type
   `jsg::Rc<Self>` with another name is still an ordinary argument. A `this` parameter that
   isn't first, or has another type, is a compile error.
-- Return types of `Result<T, E>` automatically throw a JavaScript exception on `Err`.
+- Return types of `Result<T, E>` automatically throw a JavaScript exception on `Err`, and so
+  does an error from converting the return value with `jsg::ToJS`.
 - The Rust `snake_case` name is converted to `camelCase` for JavaScript; override with
   `#[jsg_method(name = "jsName")]`.
 - The first typed parameter may be `&mut Lock` / `&mut jsg::Lock` to receive the
@@ -461,7 +467,8 @@ use no-op `Traced` impls; containers/wrappers recurse to inner values.
 | `Vec<T>`, `HashMap<K,V>`, `BTreeMap<K,V>`, `HashSet<T>`, `BTreeSet<T>` | Delegates recursively to contained values |
 | `Cell<T>` / `std::cell::Cell<T>` | Delegates via `as_ptr()` read (safe under single-threaded, non-reentrant GC tracing) |
 | `RefCell<T>` | Delegates via `try_borrow()`; skipped while mutably borrowed (debug builds abort if `T` can hold GC references) |
-| Plain data / primitives / `#[jsg_struct]` types | No-op `Traced` |
+| Plain data / primitives | No-op `Traced` |
+| `#[jsg_struct]` types | Delegates to each field, like a resource |
 | Any other `T: Traced` | Uses `T`'s implementation |
 
 The `Cell<…>` variants are required whenever a traced field needs to be mutated

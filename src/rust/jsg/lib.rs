@@ -8,6 +8,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod buffer;
 pub mod fast_api;
 pub mod feature_flags;
 mod isolate_state;
@@ -15,11 +16,15 @@ pub mod lenient;
 pub mod macros;
 pub mod modules;
 pub mod nullable;
+mod promise;
 pub mod resource;
 mod scope;
+pub mod ser;
 pub mod v8;
 mod wrappable;
 
+pub use buffer::ToJsArrayBuffer;
+pub use buffer::ToJsTypedArray;
 pub use feature_flags::FeatureFlags;
 use isolate_state::IsolateState;
 pub use lenient::Lenient;
@@ -486,6 +491,9 @@ impl Error {
 /// - `NonCoercible<String>` - only accepts JavaScript strings
 /// - `NonCoercible<bool>` - only accepts JavaScript booleans
 /// - `NonCoercible<Number>` - only accepts JavaScript numbers
+/// - `NonCoercible<u32>` and the other integers of up to 32 bits - only accept JavaScript
+///   numbers, which must be in range
+/// - `NonCoercible<i64>` and `NonCoercible<u64>` - only accept JavaScript `BigInt`s
 ///
 /// # Example
 ///
@@ -544,12 +552,12 @@ impl<T> Deref for NonCoercible<T> {
     }
 }
 
-/// A wrapper type for JavaScript numbers (IEEE 754 double-precision floats).
+/// A JavaScript number (an IEEE 754 double-precision float).
 ///
-/// `Number` represents JavaScript's `number` type, which is always a 64-bit
-/// floating-point value. This wrapper type is used instead of raw `f64` to
-/// distinguish between JavaScript numbers and Rust's `f64` type used for
-/// `Float64Array` elements.
+/// `Number` is a plain value, not a V8 handle, so it needs no `Lock` until it converts to
+/// JavaScript. It is the type of a number parameter: it converts from any value with JavaScript's
+/// `ToNumber`, like C++ JSG's `double`, and `NonCoercible<Number>` accepts only a number. An `f64`
+/// or `f32` converts to a number too, but only to JavaScript.
 ///
 /// # Usage
 ///
@@ -569,8 +577,7 @@ impl<T> Deref for NonCoercible<T> {
 /// | Rust Type | JavaScript Type |
 /// |-----------|-----------------|
 /// | `jsg::Number` | `number` |
-/// | `f64` | Used for `Float64Array` elements |
-/// | `Vec<f64>` | `Float64Array` |
+/// | `f64` | `number`, to JavaScript only |
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
 pub struct Number {
     value: f64,
@@ -964,6 +971,43 @@ impl<'s> Lock<'s> {
                 None => Err(Error::pending()),
             },
         }
+    }
+
+    /// Returns the exception that [`Lock::throw_exception`] would throw for `err`, without
+    /// throwing it: an internal error is redacted (and its message logged) the same way.
+    ///
+    /// Use it to reject a promise with an `Error`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `err` itself if [`Error::is_pending`] is true: the exception it stands for is
+    /// pending in V8, and returning the error propagates it. While execution is terminating,
+    /// creates nothing and returns [`Error::pending`]'s error, so that returning it keeps the
+    /// termination; an internal error's message is still logged.
+    pub fn exception(&mut self, err: &Error) -> Result<v8::Local<'s, v8::Value>> {
+        if err.is_pending() {
+            return Err(err.clone());
+        }
+        if self.is_execution_terminating() {
+            // Creating the exception while execution is terminating fails a V8 debug check, and
+            // nothing could be rejected with it.
+            if err.is_internal {
+                // Logs the message and throws nothing.
+                self.throw_internal_error(&err.message);
+            }
+            return Err(Error::pending());
+        }
+        if err.is_internal {
+            // SAFETY: isolate is valid and locked (guaranteed by Lock); the exception lives in
+            // the lock's scope.
+            return Ok(unsafe {
+                v8::Local::from_ffi(v8::ffi::exception_create_internal(
+                    self.isolate().as_ffi(),
+                    &err.message,
+                ))
+            });
+        }
+        Ok(err.to_local(self))
     }
 
     /// Throws an internal error as a V8 exception, matching `makeInternalError()` in C++.

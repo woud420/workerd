@@ -47,21 +47,6 @@ namespace workerd::rust::jsg {
     return to_ffi(v8::v8_type::New(arrayBuffer, 0, length));                                       \
   }
 
-#define DEFINE_TYPED_ARRAY_UNWRAP(name, v8_type, elem_type)                                        \
-  ::rust::Vec<elem_type> unwrap_##name(Isolate* isolate, Local value) {                            \
-    auto v8Val = local_from_ffi<v8::Value>(kj::mv(value));                                         \
-    KJ_REQUIRE(v8Val->Is##v8_type(), "Expected a " #v8_type);                                      \
-    auto typed = v8Val.As<v8::v8_type>();                                                          \
-    ::rust::Vec<elem_type> result;                                                                 \
-    result.reserve(typed->Length());                                                               \
-    auto data = reinterpret_cast<elem_type*>(                                                      \
-        static_cast<uint8_t*>(typed->Buffer()->Data()) + typed->ByteOffset());                     \
-    for (size_t i = 0; i < typed->Length(); i++) {                                                 \
-      result.push_back(data[i]);                                                                   \
-    }                                                                                              \
-    return result;                                                                                 \
-  }
-
 #define DEFINE_TYPED_ARRAY_GET(name, v8_type, elem_type)                                           \
   elem_type local_##name##_get(const Local& array, size_t index) {                                 \
     auto typed = local_as_ref_from_ffi<v8::v8_type>(array);                                        \
@@ -271,6 +256,10 @@ bool local_is_function(const Local& val) {
   return local_as_ref_from_ffi<v8::Value>(val)->IsFunction();
 }
 
+bool local_is_promise(const Local& val) {
+  return local_as_ref_from_ffi<v8::Value>(val)->IsPromise();
+}
+
 bool local_is_symbol(const Local& val) {
   return local_as_ref_from_ffi<v8::Value>(val)->IsSymbol();
 }
@@ -442,6 +431,10 @@ int64_t local_big_int_int64_value(const Local& value, bool& lossless) {
   return local_as_ref_from_ffi<v8::BigInt>(value)->Int64Value(&lossless);
 }
 
+uint64_t local_big_int_uint64_value(const Local& value, bool& lossless) {
+  return local_as_ref_from_ffi<v8::BigInt>(value)->Uint64Value(&lossless);
+}
+
 // Local<Date>
 // Empty, with the exception pending, if creating the object throws.
 MaybeLocal date_new(Isolate* isolate, double time) {
@@ -471,25 +464,38 @@ MaybeLocal local_function_call(
   return maybe_local_to_ffi(fn->Call(context, receiver, v8Args.size(), v8Args.data()));
 }
 
-MaybeLocal function_new(Isolate* isolate, size_t callback, kj::Rc<Wrappable> wrappable) {
-  auto context = isolate->GetCurrentContext();
-  // Like the functions C++ JSG wraps (FunctionWrapper::wrap() in jsg/function.h): the wrapper
-  // keeps the Wrappable alive and traced for as long as the function is reachable.
-  auto data = wrappable->attachOpaqueWrapper(context, true);
-  return maybe_local_to_ffi(v8::Function::New(
-      context, reinterpret_cast<v8::FunctionCallback>(reinterpret_cast<void*>(callback)), data));
+MaybeLocal function_new(Isolate* isolate, size_t callback, const Local& data) {
+  return maybe_local_to_ffi(v8::Function::New(isolate->GetCurrentContext(),
+      reinterpret_cast<v8::FunctionCallback>(reinterpret_cast<void*>(callback)),
+      local_as_ref_from_ffi<v8::Value>(data)));
 }
 
 // Local<Object>
-void local_object_set_property(Isolate* isolate, Local& object, ::rust::Str key, Local value) {
-  auto v8_obj = local_as_ref_from_ffi<v8::Object>(object);
+Local object_new_with_data_properties(
+    Isolate* isolate, ::rust::Slice<const ::rust::Str> keys, ::rust::Slice<const Local> values) {
+  KJ_REQUIRE(keys.size() == values.size());
   auto context = isolate->GetCurrentContext();
-  auto v8_key = makeInternedStr(isolate, key);
-  ::workerd::jsg::check(v8_obj->Set(context, v8_key, local_from_ffi<v8::Value>(kj::mv(value))));
+  auto object = v8::Object::New(isolate);
+  for (size_t i = 0; i < keys.size(); i++) {
+    // Unlike Set(), CreateDataProperty() doesn't look up the prototype chain, so no setter runs,
+    // and on an ordinary object no Proxy trap runs either: nothing here runs JavaScript, so it
+    // can't throw.
+    auto defined = object->CreateDataProperty(
+        context, makeInternedStr(isolate, keys[i]), local_as_ref_from_ffi<v8::Value>(values[i]));
+    KJ_ASSERT(defined.FromMaybe(false), "defining a property of a new object failed", keys[i]);
+  }
+  return to_ffi(kj::mv(object));
 }
 
 // No TryCatch in the shims below that run JavaScript: what it throws stays pending, as in
 // local_function_call().
+
+bool local_object_set_property(Isolate* isolate, Local& object, ::rust::Str key, Local value) {
+  auto v8_obj = local_as_ref_from_ffi<v8::Object>(object);
+  auto context = isolate->GetCurrentContext();
+  auto v8_key = makeInternedStr(isolate, key);
+  return v8_obj->Set(context, v8_key, local_from_ffi<v8::Value>(kj::mv(value))).IsJust();
+}
 
 bool local_object_has_property(Isolate* isolate, const Local& object, ::rust::Str key, bool& has) {
   auto v8_obj = local_as_ref_from_ffi<v8::Object>(object);
@@ -505,6 +511,78 @@ MaybeLocal local_object_get_property(Isolate* isolate, const Local& object, ::ru
   return maybe_local_to_ffi(v8_obj->Get(context, v8_key));
 }
 
+// Local<Promise>
+static_assert(static_cast<uint8_t>(PromiseState::Pending) == v8::Promise::kPending);
+static_assert(static_cast<uint8_t>(PromiseState::Fulfilled) == v8::Promise::kFulfilled);
+static_assert(static_cast<uint8_t>(PromiseState::Rejected) == v8::Promise::kRejected);
+
+PromiseState local_promise_state(const Local& promise) {
+  return static_cast<PromiseState>(local_as_ref_from_ffi<v8::Promise>(promise)->State());
+}
+
+Local local_promise_result(const Local& promise) {
+  return to_ffi(local_as_ref_from_ffi<v8::Promise>(promise)->Result());
+}
+
+void local_promise_mark_as_handled(const Local& promise) {
+  local_as_ref_from_ffi<v8::Promise>(promise)->MarkAsHandled();
+}
+
+namespace {
+// Whether an exception or a termination is pending, in which case the promise shims call nothing
+// in V8 and fail, leaving it pending. Promise::Resolver::New(), Then() and Catch() would clear
+// it: they open a PrepareForExecutionScope, which clears the pending exception, a termination
+// included, so that a terminated script would run on. V8 also requires that embedders don't
+// enter it at all while execution is terminating.
+bool exceptionPending(Isolate* isolate) {
+  return isolate->IsExecutionTerminating() || isolate->HasPendingException();
+}
+}  // namespace
+
+MaybeLocal local_promise_then(Isolate* isolate, const Local& promise, const Local& on_fulfilled) {
+  if (exceptionPending(isolate)) return maybe_local_to_ffi(v8::MaybeLocal<v8::Value>());
+  return maybe_local_to_ffi(local_as_ref_from_ffi<v8::Promise>(promise)->Then(
+      isolate->GetCurrentContext(), local_as_ref_from_ffi<v8::Function>(on_fulfilled)));
+}
+
+MaybeLocal local_promise_catch(Isolate* isolate, const Local& promise, const Local& on_rejected) {
+  if (exceptionPending(isolate)) return maybe_local_to_ffi(v8::MaybeLocal<v8::Value>());
+  return maybe_local_to_ffi(local_as_ref_from_ffi<v8::Promise>(promise)->Catch(
+      isolate->GetCurrentContext(), local_as_ref_from_ffi<v8::Function>(on_rejected)));
+}
+
+MaybeLocal local_promise_then_or_catch(
+    Isolate* isolate, const Local& promise, const Local& on_fulfilled, const Local& on_rejected) {
+  if (exceptionPending(isolate)) return maybe_local_to_ffi(v8::MaybeLocal<v8::Value>());
+  return maybe_local_to_ffi(local_as_ref_from_ffi<v8::Promise>(promise)->Then(
+      isolate->GetCurrentContext(), local_as_ref_from_ffi<v8::Function>(on_fulfilled),
+      local_as_ref_from_ffi<v8::Function>(on_rejected)));
+}
+
+// Local<PromiseResolver>
+MaybeLocal promise_resolver_new(Isolate* isolate) {
+  if (exceptionPending(isolate)) return maybe_local_to_ffi(v8::MaybeLocal<v8::Value>());
+  return maybe_local_to_ffi(v8::Promise::Resolver::New(isolate->GetCurrentContext()));
+}
+
+Local local_promise_resolver_promise(const Local& resolver) {
+  return to_ffi(local_as_ref_from_ffi<v8::Promise::Resolver>(resolver)->GetPromise());
+}
+
+bool local_promise_resolver_resolve(Isolate* isolate, const Local& resolver, const Local& value) {
+  if (exceptionPending(isolate)) return false;
+  return local_as_ref_from_ffi<v8::Promise::Resolver>(resolver)
+      ->Resolve(isolate->GetCurrentContext(), local_as_ref_from_ffi<v8::Value>(value))
+      .IsJust();
+}
+
+bool local_promise_resolver_reject(Isolate* isolate, const Local& resolver, const Local& reason) {
+  if (exceptionPending(isolate)) return false;
+  return local_as_ref_from_ffi<v8::Promise::Resolver>(resolver)
+      ->Reject(isolate->GetCurrentContext(), local_as_ref_from_ffi<v8::Value>(reason))
+      .IsJust();
+}
+
 // Local<Array>
 Local local_new_array(Isolate* isolate, size_t length) {
   return to_ffi(v8::Array::New(isolate, length));
@@ -514,16 +592,19 @@ uint32_t local_array_length(const Local& array) {
   return local_as_ref_from_ffi<v8::Array>(array)->Length();
 }
 
-Local local_array_get(Isolate* isolate, const Local& array, uint32_t index) {
-  auto context = isolate->GetCurrentContext();
-  auto v8Array = local_as_ref_from_ffi<v8::Array>(array);
-  return to_ffi(::workerd::jsg::check(v8Array->Get(context, index)));
+Local array_new_with_elements(Isolate* isolate, ::rust::Slice<const Local> elements) {
+  v8::LocalVector<v8::Value> v8Elements(isolate, elements.size());
+  for (size_t i = 0; i < elements.size(); i++) {
+    v8Elements[i] = local_as_ref_from_ffi<v8::Value>(elements[i]);
+  }
+  // Stores the elements directly, without Set(), so no setter on Array.prototype runs.
+  return to_ffi(v8::Array::New(isolate, v8Elements.data(), v8Elements.size()));
 }
 
-void local_array_set(Isolate* isolate, Local& array, uint32_t index, Local value) {
+bool local_array_set(Isolate* isolate, Local& array, uint32_t index, Local value) {
   auto context = isolate->GetCurrentContext();
   auto v8Array = local_as_ref_from_ffi<v8::Array>(array);
-  ::workerd::jsg::check(v8Array->Set(context, index, local_from_ffi<v8::Value>(kj::mv(value))));
+  return v8Array->Set(context, index, local_from_ffi<v8::Value>(kj::mv(value))).IsJust();
 }
 
 // Local<ArrayBuffer>
@@ -661,8 +742,17 @@ DEFINE_TYPED_ARRAY_NEW(bigint64_array, BigInt64Array, int64_t)
 DEFINE_TYPED_ARRAY_NEW(biguint64_array, BigUint64Array, uint64_t)
 
 // Wrappers
-MaybeLocal wrap_resource(Isolate* isolate, kj::Rc<Wrappable> wrappable, const Global& tmpl) {
-  if (wrappable->hasWrapper() && wrappable->getIsolate() != isolate) {
+MaybeLocal wrap_resource(
+    Isolate* isolate, kj::Rc<Wrappable> wrappable, const Global& tmpl, bool& wrappedElsewhere) {
+  // Checked here rather than through `call_into_js()`, which would make a second FFI call on
+  // every wrap, though most only read the cached handle.
+  if (isolate->IsExecutionTerminating()) {
+    wrappedElsewhere = false;
+    return MaybeLocal{.ptr = 0};
+  }
+
+  wrappedElsewhere = wrappable->hasWrapper() && wrappable->getIsolate() != isolate;
+  if (wrappedElsewhere) {
     return MaybeLocal{.ptr = 0};
   }
 
@@ -673,8 +763,11 @@ MaybeLocal wrap_resource(Isolate* isolate, kj::Rc<Wrappable> wrappable, const Gl
 
   auto& global_tmpl = global_as_ref_from_ffi<v8::FunctionTemplate>(tmpl);
   auto local_tmpl = v8::Local<v8::FunctionTemplate>::New(isolate, global_tmpl);
-  v8::Local<v8::Object> object = ::workerd::jsg::check(
-      local_tmpl->InstanceTemplate()->NewInstance(isolate->GetCurrentContext()));
+  v8::Local<v8::Object> object;
+  if (!local_tmpl->InstanceTemplate()->NewInstance(isolate->GetCurrentContext()).ToLocal(&object)) {
+    // Leave the exception pending; see `call_into_js()`.
+    return MaybeLocal{.ptr = 0};
+  }
 
   // attachWrapper sets up CppgcShim, TracedReference, internal fields, etc.
   wrappable->attachWrapper(isolate, object, true,
@@ -702,6 +795,11 @@ void wrappable_attach_wrapper(kj::Rc<Wrappable> wrappable, FunctionCallbackInfo&
   object->SetAlignedPointerInInternalField(::workerd::jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX,
       tagAddress,
       static_cast<v8::EmbedderDataTypeTag>(::workerd::jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX));
+}
+
+Local wrappable_attach_opaque_wrapper(Isolate* isolate, kj::Rc<Wrappable> wrappable) {
+  // Like the data of the functions C++ JSG wraps (FunctionWrapper::wrap() in jsg/function.h).
+  return to_ffi(wrappable->attachOpaqueWrapper(isolate->GetCurrentContext(), true));
 }
 
 // Unwrappers
@@ -773,18 +871,6 @@ kj::Maybe<kj::Rc<Wrappable>> unwrap_resource(Isolate* isolate, Local value) {
   }
   return kj::none;
 }
-
-// TypedArray unwrap functions
-DEFINE_TYPED_ARRAY_UNWRAP(uint8_array, Uint8Array, uint8_t)
-DEFINE_TYPED_ARRAY_UNWRAP(uint16_array, Uint16Array, uint16_t)
-DEFINE_TYPED_ARRAY_UNWRAP(uint32_array, Uint32Array, uint32_t)
-DEFINE_TYPED_ARRAY_UNWRAP(int8_array, Int8Array, int8_t)
-DEFINE_TYPED_ARRAY_UNWRAP(int16_array, Int16Array, int16_t)
-DEFINE_TYPED_ARRAY_UNWRAP(int32_array, Int32Array, int32_t)
-DEFINE_TYPED_ARRAY_UNWRAP(float32_array, Float32Array, float)
-DEFINE_TYPED_ARRAY_UNWRAP(float64_array, Float64Array, double)
-DEFINE_TYPED_ARRAY_UNWRAP(bigint64_array, BigInt64Array, int64_t)
-DEFINE_TYPED_ARRAY_UNWRAP(biguint64_array, BigUint64Array, uint64_t)
 
 // Uses V8's Array::Iterate() which is faster than indexed access.
 // Returns Global handles because Local handles get reused during iteration.
@@ -1449,6 +1535,23 @@ Local exception_create_from_bytes(
   return exceptionCreateFromMessage(exception_type, message);
 }
 
+namespace {
+// Mirrors makeInternalError() from util.c++, which it calls: generates a unique error ID, logs
+// the internal message (with ID) to KJ_LOG(ERROR) for Sentry, and returns a generic
+// "internal error; reference = <id>" JS Error.
+v8::Local<v8::Value> createInternalError(Isolate* isolate, ::rust::Str internalMessage) {
+  // kj::heapString(data, size) copies exactly `size` bytes and appends a NUL,
+  // avoiding the out-of-bounds read that kj::StringPtr(data, size) would cause
+  // on non-NUL-terminated Rust &str data.
+  auto message = kj::heapString(internalMessage.data(), internalMessage.size());
+  return ::workerd::jsg::makeInternalError(isolate, message);
+}
+}  // namespace
+
+Local exception_create_internal(Isolate* isolate, ::rust::Str internalMessage) {
+  return to_ffi(createInternalError(isolate, internalMessage));
+}
+
 // TryCatch
 bool catch_exception(v8::TryCatch& tryCatch, MaybeLocal& exception) {
   // The rule of jsg::Lock::tryCatch(): nothing caught means a termination, which V8 may already
@@ -1486,19 +1589,14 @@ void isolate_throw_error(Isolate* isolate, ::rust::Str description) {
 }
 
 void isolate_throw_internal_error(Isolate* isolate, ::rust::Str internalMessage) {
-  // kj::heapString(data, size) copies exactly `size` bytes and appends a NUL,
-  // avoiding the out-of-bounds read that kj::StringPtr(data, size) would cause
-  // on non-NUL-terminated Rust &str data.
-  auto message = kj::heapString(internalMessage.data(), internalMessage.size());
   if (isolate->IsExecutionTerminating()) {
     // Logs the message, but creates no error: creating one while execution is terminating fails
-    // a V8 debug check, and it would not be thrown.
-    KJ_LOG(ERROR, message);
+    // a V8 debug check, and it would not be thrown. See createInternalError() for why the message
+    // is copied.
+    KJ_LOG(ERROR, kj::heapString(internalMessage.data(), internalMessage.size()));
     return;
   }
-  // makeInternalError() generates a unique error ID, logs the internal message (with ID) to
-  // KJ_LOG(ERROR) for Sentry, and returns a generic "internal error; reference = <id>" JS Error.
-  isolate->ThrowException(::workerd::jsg::makeInternalError(isolate, message));
+  isolate->ThrowException(createInternalError(isolate, internalMessage));
 }
 
 void isolate_terminate_execution(Isolate* isolate) {
